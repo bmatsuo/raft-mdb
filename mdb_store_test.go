@@ -2,10 +2,11 @@ package raftmdb
 
 import (
 	"bytes"
-	"github.com/hashicorp/raft"
 	"io/ioutil"
 	"os"
 	"testing"
+
+	"github.com/hashicorp/raft"
 )
 
 func MDBTestStore(t testing.TB) (string, *MDBStore) {
