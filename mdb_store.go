@@ -2,10 +2,12 @@ package raftmdb
 
 import (
 	"fmt"
-	"github.com/armon/gomdb"
-	"github.com/hashicorp/raft"
 	"os"
 	"path/filepath"
+
+	"github.com/bmatsuo/lmdb-go/exp/lmdbscan"
+	"github.com/bmatsuo/lmdb-go/lmdb"
+	"github.com/hashicorp/raft"
 )
 
 const (
@@ -20,9 +22,9 @@ var mdbPath = "mdb/"
 // MDBStore provides an implementation of LogStore and StableStore,
 // all backed by a single MDB database.
 type MDBStore struct {
-	env     *mdb.Env
+	env     *lmdb.Env
 	path    string
-	maxSize uint64
+	maxSize int64
 }
 
 // NewMDBStore returns a new MDBStore and potential
@@ -35,7 +37,7 @@ func NewMDBStore(base string) (*MDBStore, error) {
 // NewMDBStore returns a new MDBStore and potential
 // error. Requres a base directory from which to operate,
 // and a maximum size. If maxSize is not 0, a default value is used.
-func NewMDBStoreWithSize(base string, maxSize uint64) (*MDBStore, error) {
+func NewMDBStoreWithSize(base string, maxSize int64) (*MDBStore, error) {
 	// Get the paths
 	path := filepath.Join(base, mdbPath)
 	if err := os.MkdirAll(path, 0755); err != nil {
@@ -48,7 +50,7 @@ func NewMDBStoreWithSize(base string, maxSize uint64) (*MDBStore, error) {
 	}
 
 	// Create the env
-	env, err := mdb.NewEnv()
+	env, err := lmdb.NewEnv()
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +73,7 @@ func NewMDBStoreWithSize(base string, maxSize uint64) (*MDBStore, error) {
 // initialize is used to setup the mdb store
 func (m *MDBStore) initialize() error {
 	// Allow up to 2 sub-dbs
-	if err := m.env.SetMaxDBs(mdb.DBI(2)); err != nil {
+	if err := m.env.SetMaxDBs(2); err != nil {
 		return err
 	}
 
@@ -81,18 +83,15 @@ func (m *MDBStore) initialize() error {
 	}
 
 	// Open the DB
-	if err := m.env.Open(m.path, mdb.NOTLS, 0755); err != nil {
+	if err := m.env.Open(m.path, 0, 0755); err != nil {
 		return err
 	}
 
 	// Create all the tables
-	tx, _, err := m.startTxn(false, dbLogs, dbConf)
-	if err != nil {
-		tx.Abort()
-		return err
-	}
-	return tx.Commit()
+	return m.runTxn(false, []string{dbLogs, dbConf}, lmdbNop)
 }
+
+func lmdbNop([]lmdb.DBI) lmdb.TxnOp { return func(_ *lmdb.Txn) error { return nil } }
 
 // Close is used to gracefully shutdown the MDB store
 func (m *MDBStore) Close() error {
@@ -101,100 +100,84 @@ func (m *MDBStore) Close() error {
 }
 
 // startTxn is used to start a transaction and open all the associated sub-databases
-func (m *MDBStore) startTxn(readonly bool, open ...string) (*mdb.Txn, []mdb.DBI, error) {
+func (m *MDBStore) runTxn(readonly bool, open []string, fn func([]lmdb.DBI) lmdb.TxnOp) error {
 	var txFlags uint = 0
 	var dbFlags uint = 0
 	if readonly {
-		txFlags |= mdb.RDONLY
+		txFlags |= lmdb.Readonly
 	} else {
-		dbFlags |= mdb.CREATE
+		dbFlags |= lmdb.Create
 	}
 
-	tx, err := m.env.BeginTxn(nil, txFlags)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	var dbs []mdb.DBI
-	for _, name := range open {
-		dbi, err := tx.DBIOpen(name, dbFlags)
-		if err != nil {
-			tx.Abort()
-			return nil, nil, err
+	err := m.env.RunTxn(txFlags, func(txn *lmdb.Txn) (err error) {
+		var dbs []lmdb.DBI
+		for _, name := range open {
+			dbi, err := txn.OpenDBI(name, dbFlags)
+			if err != nil {
+				return nil
+			}
+			dbs = append(dbs, dbi)
 		}
-		dbs = append(dbs, dbi)
-	}
-
-	return tx, dbs, nil
+		return fn(dbs)(txn)
+	})
+	return err
 }
 
 func (m *MDBStore) FirstIndex() (uint64, error) {
-	tx, dbis, err := m.startTxn(true, dbLogs)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Abort()
-
-	cursor, err := tx.CursorOpen(dbis[0])
-	if err != nil {
-		return 0, err
-	}
-	defer cursor.Close()
-
-	key, _, err := cursor.Get(nil, mdb.FIRST)
-	if err == mdb.NotFound {
-		return 0, nil
-	} else if err != nil {
-		return 0, err
-	}
-
-	// Convert the key to the index
-	return bytesToUint64(key), nil
+	_, _, index, err := m.getIndex(nil, nil, lmdb.First)
+	return index, err
 }
 
 func (m *MDBStore) LastIndex() (uint64, error) {
-	tx, dbis, err := m.startTxn(true, dbLogs)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Abort()
+	_, _, index, err := m.getIndex(nil, nil, lmdb.Last)
+	return index, err
+}
 
-	cursor, err := tx.CursorOpen(dbis[0])
-	if err != nil {
-		return 0, err
-	}
-	defer cursor.Close()
+func (m *MDBStore) getIndex(k, v []byte, op uint) ([]byte, []byte, uint64, error) {
+	var _k, _v []byte
+	var k64 uint64
+	err := m.runTxn(true, []string{dbLogs}, func(dbis []lmdb.DBI) lmdb.TxnOp {
+		return func(txn *lmdb.Txn) error {
+			txn.RawRead = true
 
-	key, _, err := cursor.Get(nil, mdb.LAST)
-	if err == mdb.NotFound {
-		return 0, nil
-	} else if err != nil {
-		return 0, err
-	}
+			cursor, err := txn.OpenCursor(dbis[0])
+			if err != nil {
+				return err
+			}
+			defer cursor.Close()
 
-	// Convert the key to the index
-	return bytesToUint64(key), nil
+			_k, _v, err = cursor.Get(nil, nil, op)
+			if lmdb.IsNotFound(err) {
+				return nil
+			} else if err == nil {
+				k64 = bytesToUint64(_k)
+			}
+
+			return err
+		}
+	})
+	return _k, _v, k64, err
 }
 
 // Gets a log entry at a given index
 func (m *MDBStore) GetLog(index uint64, logOut *raft.Log) error {
 	key := uint64ToBytes(index)
+	return m.runTxn(true, []string{dbLogs}, func(dbis []lmdb.DBI) lmdb.TxnOp {
+		return func(txn *lmdb.Txn) error {
+			txn.RawRead = true
 
-	tx, dbis, err := m.startTxn(true, dbLogs)
-	if err != nil {
-		return err
-	}
-	defer tx.Abort()
+			val, err := txn.Get(dbis[0], key)
+			if lmdb.IsNotFound(err) {
+				return raft.ErrLogNotFound
+			} else if err != nil {
+				return err
+			}
 
-	val, err := tx.Get(dbis[0], key)
-	if err == mdb.NotFound {
-		return raft.ErrLogNotFound
-	} else if err != nil {
-		return err
-	}
+			// Convert the value to a log
+			return decodeMsgPack(val, logOut)
+		}
+	})
 
-	// Convert the value to a log
-	return decodeMsgPack(val, logOut)
 }
 
 // Stores a log entry
@@ -205,97 +188,68 @@ func (m *MDBStore) StoreLog(log *raft.Log) error {
 // Stores multiple log entries
 func (m *MDBStore) StoreLogs(logs []*raft.Log) error {
 	// Start write txn
-	tx, dbis, err := m.startTxn(false, dbLogs)
-	if err != nil {
-		return err
-	}
+	return m.runTxn(false, []string{dbLogs}, func(dbis []lmdb.DBI) lmdb.TxnOp {
+		return func(txn *lmdb.Txn) error {
+			txn.RawRead = true
 
-	for _, log := range logs {
-		// Convert to an on-disk format
-		key := uint64ToBytes(log.Index)
-		val, err := encodeMsgPack(log)
-		if err != nil {
-			tx.Abort()
-			return err
-		}
+			for _, log := range logs {
+				// Convert to an on-disk format
+				key := uint64ToBytes(log.Index)
+				val, err := encodeMsgPack(log)
+				if err != nil {
+					return err
+				}
 
-		// Write to the table
-		if err := tx.Put(dbis[0], key, val.Bytes(), 0); err != nil {
-			tx.Abort()
-			return err
+				// Write to the table
+				if err := txn.Put(dbis[0], key, val.Bytes(), 0); err != nil {
+					return err
+				}
+			}
+
+			return nil
 		}
-	}
-	return tx.Commit()
+	})
 }
 
 // Deletes a range of log entries. The range is inclusive.
 func (m *MDBStore) DeleteRange(minIdx, maxIdx uint64) error {
 	// Start write txn
-	tx, dbis, err := m.startTxn(false, dbLogs)
-	if err != nil {
-		return err
-	}
-	defer tx.Abort()
+	return m.runTxn(false, []string{dbLogs}, func(dbis []lmdb.DBI) lmdb.TxnOp {
+		return func(txn *lmdb.Txn) (err error) {
+			txn.RawRead = true
 
-	// Hack around an LMDB bug by running the delete multiple
-	// times until there are no further rows.
-	var num int
-DELETE:
-	num, err = m.innerDeleteRange(tx, dbis, minIdx, maxIdx)
-	if err != nil {
-		return err
-	}
-	if num > 0 {
-		goto DELETE
-	}
-	return tx.Commit()
+			// Hack around an LMDB bug by running the delete multiple
+			// times until there are no further rows.
+			var num int
+			for cont := true; cont; cont = num <= 0 {
+				num, err = m.innerDeleteRange(txn, dbis, minIdx, maxIdx)
+				if err != nil {
+					return err
+				}
+			}
+
+			return nil
+		}
+	})
+
 }
 
 // innerDeleteRange does a single pass to delete the indexes (inclusively)
-func (m *MDBStore) innerDeleteRange(tx *mdb.Txn, dbis []mdb.DBI, minIdx, maxIdx uint64) (num int, err error) {
-	// Open a cursor
-	cursor, err := tx.CursorOpen(dbis[0])
-	if err != nil {
-		return num, err
-	}
-
-	var key []byte
-	didDelete := false
-	for {
-		if didDelete {
-			key, _, err = cursor.Get(nil, mdb.GET_CURRENT)
-			didDelete = false
-
-			// LMDB will return EINVAL(22) for the GET_CURRENT op if
-			// there is no further keys. We treat this as no more
-			// keys being found.
-			if num, ok := err.(mdb.Errno); ok && num == 22 {
-				err = mdb.NotFound
-			}
-		} else {
-			key, _, err = cursor.Get(nil, mdb.NEXT)
-		}
-		if err == mdb.NotFound || len(key) == 0 {
-			break
-		} else if err != nil {
-			return num, err
-		}
-
-		// Check if the key is in the range
-		keyVal := bytesToUint64(key)
-		if keyVal < minIdx {
-			continue
-		}
-		if keyVal > maxIdx {
+func (m *MDBStore) innerDeleteRange(txn *lmdb.Txn, dbis []lmdb.DBI, minIdx, maxIdx uint64) (num int, err error) {
+	k := uint64ToBytes(minIdx)
+	scanner := lmdbscan.New(txn, dbis[0])
+	scanner.Set(k, nil, lmdb.SetKey)
+	for scanner.Scan() {
+		if maxIdx < bytesToUint64(scanner.Key()) {
 			break
 		}
-
-		// Attempt delete
-		if err := cursor.Del(0); err != nil {
+		if err := scanner.Del(0); err != nil {
 			return num, err
 		}
-		didDelete = true
 		num++
+	}
+	if err := scanner.Err(); err != nil {
+		return num, err
 	}
 	return num, nil
 }
@@ -303,31 +257,25 @@ func (m *MDBStore) innerDeleteRange(tx *mdb.Txn, dbis []mdb.DBI, minIdx, maxIdx 
 // Set a K/V pair
 func (m *MDBStore) Set(key []byte, val []byte) error {
 	// Start write txn
-	tx, dbis, err := m.startTxn(false, dbConf)
-	if err != nil {
-		return err
-	}
-
-	if err := tx.Put(dbis[0], key, val, 0); err != nil {
-		tx.Abort()
-		return err
-	}
-	return tx.Commit()
+	return m.runTxn(false, []string{dbConf}, func(dbis []lmdb.DBI) lmdb.TxnOp {
+		return func(txn *lmdb.Txn) error { return txn.Put(dbis[0], key, val, 0) }
+	})
 }
 
 // Get a K/V pair
 func (m *MDBStore) Get(key []byte) ([]byte, error) {
+	var val []byte
 	// Start read txn
-	tx, dbis, err := m.startTxn(true, dbConf)
+	err := m.runTxn(true, []string{dbConf}, func(dbis []lmdb.DBI) lmdb.TxnOp {
+		return func(txn *lmdb.Txn) (err error) {
+			val, err = txn.Get(dbis[0], key)
+			if lmdb.IsNotFound(err) {
+				return fmt.Errorf("not found")
+			}
+			return err
+		}
+	})
 	if err != nil {
-		return nil, err
-	}
-	defer tx.Abort()
-
-	val, err := tx.Get(dbis[0], key)
-	if err == mdb.NotFound {
-		return nil, fmt.Errorf("not found")
-	} else if err != nil {
 		return nil, err
 	}
 	return val, nil
