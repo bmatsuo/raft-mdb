@@ -103,8 +103,6 @@ func (m *MDBStore) initialize() error {
 	})
 }
 
-func lmdbNop([]lmdb.DBI) lmdb.TxnOp { return func(_ *lmdb.Txn) error { return nil } }
-
 // Close is used to gracefully shutdown the MDB store
 func (m *MDBStore) Close() error {
 	m.env.Close()
@@ -128,7 +126,6 @@ func (m *MDBStore) getIndex(k, v []byte, op uint) (uint64, error) {
 		if err != nil {
 			return err
 		}
-
 		k, _, err = cursor.Get(nil, nil, op)
 		cursor.Close()
 
@@ -171,8 +168,6 @@ func (m *MDBStore) StoreLog(log *raft.Log) error {
 func (m *MDBStore) StoreLogs(logs []*raft.Log) error {
 	// Start write txn
 	return m.env.Update(func(txn *lmdb.Txn) error {
-		txn.RawRead = true
-
 		for _, log := range logs {
 			// Convert to an on-disk format
 			key := uint64ToBytes(log.Index)
@@ -196,53 +191,35 @@ func (m *MDBStore) DeleteRange(minIdx, maxIdx uint64) error {
 	// Start write txn
 	return m.env.Update(func(txn *lmdb.Txn) (err error) {
 		txn.RawRead = true
-
-		// Hack around an LMDB bug by running the delete multiple
-		// times until there are no further rows.
-		var num int
-		for cont := true; cont; cont = num <= 0 {
-			num, err = m.innerDeleteRange(txn, m.dbLogs, minIdx, maxIdx)
-			if err != nil {
+		s := lmdbscan.New(txn, m.dbLogs)
+		defer s.Close()
+		s.Set(uint64ToBytes(minIdx), nil, lmdb.SetKey)
+		for s.Scan() {
+			if maxIdx < bytesToUint64(s.Key()) {
+				break
+			}
+			if err := s.Del(0); err != nil {
 				return err
 			}
 		}
-
-		return nil
+		return s.Err()
 	})
-
-}
-
-// innerDeleteRange does a single pass to delete the indexes (inclusively)
-func (m *MDBStore) innerDeleteRange(txn *lmdb.Txn, dbi lmdb.DBI, minIdx, maxIdx uint64) (num int, err error) {
-	s := lmdbscan.New(txn, dbi)
-	defer s.Close()
-
-	s.Set(uint64ToBytes(minIdx), nil, lmdb.SetKey)
-	for s.Scan() {
-		if maxIdx < bytesToUint64(s.Key()) {
-			break
-		}
-		if err := s.Del(0); err != nil {
-			return num, err
-		}
-		num++
-	}
-	if err := s.Err(); err != nil {
-		return num, err
-	}
-	return num, nil
 }
 
 // Set a K/V pair
-func (m *MDBStore) Set(key []byte, val []byte) error {
-	// Start write txn
-	return m.env.Update(func(txn *lmdb.Txn) error { return txn.Put(m.dbConf, key, val, 0) })
+func (m *MDBStore) Set(key, val []byte) error {
+	return m.env.Update(func(txn *lmdb.Txn) error {
+		return txn.Put(m.dbConf, key, val, 0)
+	})
+}
+
+func (m *MDBStore) SetUint64(key []byte, val uint64) error {
+	return m.Set(key, uint64ToBytes(val))
 }
 
 // Get a K/V pair
 func (m *MDBStore) Get(key []byte) ([]byte, error) {
 	var val []byte
-	// Start read txn
 	err := m.env.View(func(txn *lmdb.Txn) (err error) {
 		val, err = txn.Get(m.dbConf, key)
 		if lmdb.IsNotFound(err) {
@@ -250,20 +227,20 @@ func (m *MDBStore) Get(key []byte) ([]byte, error) {
 		}
 		return err
 	})
-	if err != nil {
-		return nil, err
-	}
-	return val, nil
+	return val, err
 }
 
-func (m *MDBStore) SetUint64(key []byte, val uint64) error {
-	return m.Set(key, uint64ToBytes(val))
-}
-
-func (m *MDBStore) GetUint64(key []byte) (uint64, error) {
-	buf, err := m.Get(key)
-	if err != nil {
-		return 0, err
-	}
-	return bytesToUint64(buf), nil
+func (m *MDBStore) GetUint64(key []byte) (v64 uint64, err error) {
+	err = m.env.View(func(txn *lmdb.Txn) (err error) {
+		txn.RawRead = true
+		val, err := txn.Get(m.dbConf, key)
+		if lmdb.IsNotFound(err) {
+			return fmt.Errorf("not found")
+		}
+		if err == nil {
+			v64 = bytesToUint64(val)
+		}
+		return err
+	})
+	return v64, err
 }
