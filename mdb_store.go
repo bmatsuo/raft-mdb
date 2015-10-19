@@ -198,7 +198,7 @@ func (m *MDBStore) DeleteRange(minIdx, maxIdx uint64) error {
 			if maxIdx < bytesToUint64(s.Key()) {
 				break
 			}
-			if err := s.Del(0); err != nil {
+			if err := s.Cursor().Del(0); err != nil {
 				return err
 			}
 		}
