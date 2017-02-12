@@ -179,9 +179,13 @@ func (m *MDBStore) getIndex(op uint) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer m.logCursorPool.Put(cur)
+	// NOTE:
+	// The release of the cursor is not deferred because a runtime panic would
+	// not be catastrophic.  The txn, however, must be be reset to avoid stale
+	// readers causing the database to grow.
 
 	k, _, err := cur.Get(nil, nil, op)
+	m.logCursorPool.Put(cur)
 	if err == nil {
 		return bytesToUint64(k), nil
 	}
