@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/bmatsuo/lmdb-go/lmdb"
 	"github.com/bmatsuo/lmdb-go/lmdbscan"
@@ -34,6 +35,8 @@ type MDBStore struct {
 	// during updates.  bufu64 cannot be used during view transactions because
 	// they may execute concurrent with other transactions.
 	bufu64 []byte
+
+	readersChecked time.Time
 
 	txnPool       *sync.Pool
 	logCursorPool *sync.Pool
@@ -85,23 +88,31 @@ func NewMDBStoreWithSize(base string, maxSize int64) (*MDBStore, error) {
 // initialize is used to setup the mdb store
 func (m *MDBStore) initialize() error {
 	// Allow up to 2 sub-dbs
-	if err := m.env.SetMaxDBs(2); err != nil {
+	err := m.env.SetMaxDBs(2)
+	if err != nil {
 		return err
 	}
 
 	// Increase the maximum map size
-	if err := m.env.SetMapSize(m.maxSize); err != nil {
+	err = m.env.SetMapSize(m.maxSize)
+	if err != nil {
 		return err
 	}
 
 	// Open the DB
-	if err := m.env.Open(m.path, 0, 0755); err != nil {
+	err = m.env.Open(m.path, 0, 0755)
+	if err != nil {
 		m.env.Close()
 		return err
 	}
 
+	_, err = m.checkStaleReaders()
+	if err != nil {
+		return err
+	}
+
 	// Create all the tables
-	err := m.env.Update(func(txn *lmdb.Txn) (err error) {
+	err = m.env.Update(func(txn *lmdb.Txn) (err error) {
 		m.dbLogs, err = txn.OpenDBI(dbLogs, lmdb.Create)
 		if err != nil {
 			return err
@@ -156,6 +167,21 @@ func (m *MDBStore) logsCursor(txn *lmdb.Txn) (*lmdb.Cursor, error) {
 		return txn.OpenCursor(m.dbLogs)
 	}
 	return cur, nil
+}
+
+// It is important to periodically call Env.ReaderCheck() to prevent
+// unnecessary database growth.  While transactions should clean up after
+// themselves, program crashes can leave reader slots tied to dead programs
+// without calling this function.
+//
+// m.env.ReaderCheck runs quickly, but you wouldn't want to call it every
+// second.
+func (m *MDBStore) checkStaleReaders() (int, error) {
+	if m.readersChecked.IsZero() || time.Since(m.readersChecked) > time.Minute {
+		m.readersChecked = time.Now()
+		return m.env.ReaderCheck()
+	}
+	return 0, nil
 }
 
 // FirstIndex returns the first index in the MDBStore
@@ -220,6 +246,11 @@ func (m *MDBStore) GetLog(index uint64, logOut *raft.Log) error {
 
 // StoreLog stores a log entry
 func (m *MDBStore) StoreLog(log *raft.Log) error {
+	_, err := m.checkStaleReaders()
+	if err != nil {
+		return err
+	}
+
 	return m.env.Update(func(txn *lmdb.Txn) error {
 		val := bytes.NewBuffer(nil)
 		return m.putLog(txn, log, val)
@@ -228,6 +259,11 @@ func (m *MDBStore) StoreLog(log *raft.Log) error {
 
 // StoreLogs stores multiple log entries
 func (m *MDBStore) StoreLogs(logs []*raft.Log) error {
+	_, err := m.checkStaleReaders()
+	if err != nil {
+		return err
+	}
+
 	// Start write txn
 	return m.env.Update(func(txn *lmdb.Txn) error {
 		val := bytes.NewBuffer(nil)
@@ -257,6 +293,11 @@ func (m *MDBStore) putLog(txn *lmdb.Txn, log *raft.Log, val *bytes.Buffer) error
 
 // DeleteRange deletes a range of log entries. The range is inclusive.
 func (m *MDBStore) DeleteRange(minIdx, maxIdx uint64) error {
+	_, err := m.checkStaleReaders()
+	if err != nil {
+		return err
+	}
+
 	// Start write txn
 	return m.env.Update(func(txn *lmdb.Txn) (err error) {
 		txn.RawRead = true
@@ -278,6 +319,11 @@ func (m *MDBStore) DeleteRange(minIdx, maxIdx uint64) error {
 
 // Set associates a key with a value.
 func (m *MDBStore) Set(key, val []byte) error {
+	_, err := m.checkStaleReaders()
+	if err != nil {
+		return err
+	}
+
 	return m.env.Update(func(txn *lmdb.Txn) error {
 		return txn.Put(m.dbConf, key, val, 0)
 	})
@@ -285,6 +331,11 @@ func (m *MDBStore) Set(key, val []byte) error {
 
 // SetUint64 sets a key to a uint64 value.
 func (m *MDBStore) SetUint64(key []byte, val uint64) error {
+	_, err := m.checkStaleReaders()
+	if err != nil {
+		return err
+	}
+
 	return m.env.Update(func(txn *lmdb.Txn) error {
 		m.bufu64 = uint64ToBytes(m.bufu64[:0], val)
 		return txn.Put(m.dbConf, key, m.bufu64, 0)
