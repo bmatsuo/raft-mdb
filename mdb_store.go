@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bmatsuo/lmdb-go/exp/lmdbpool"
 	"github.com/bmatsuo/lmdb-go/lmdb"
 	"github.com/bmatsuo/lmdb-go/lmdbscan"
 	"github.com/hashicorp/raft"
@@ -38,7 +39,7 @@ type MDBStore struct {
 
 	readersChecked time.Time
 
-	txnPool       *sync.Pool
+	txnPool       *lmdbpool.TxnPool
 	logCursorPool *sync.Pool
 }
 
@@ -111,8 +112,11 @@ func (m *MDBStore) initialize() error {
 		return err
 	}
 
-	// Create all the tables
-	err = m.env.Update(func(txn *lmdb.Txn) (err error) {
+	// Initialize pools and open all DBIs ('tables') that will be needed during
+	// the lifetime of the MDBStore.
+	m.logCursorPool = &sync.Pool{}
+	m.txnPool = lmdbpool.NewTxnPool(m.env)
+	err = m.txnPool.Update(func(txn *lmdb.Txn) (err error) {
 		m.dbLogs, err = txn.OpenDBI(dbLogs, lmdb.Create)
 		if err != nil {
 			return err
@@ -128,33 +132,24 @@ func (m *MDBStore) initialize() error {
 		return err
 	}
 
-	m.txnPool = &sync.Pool{}
-	m.logCursorPool = &sync.Pool{}
-
 	return nil
 }
 
 // Close is used to gracefully shutdown the MDB store
 func (m *MDBStore) Close() error {
+	// Clear pools before closing the environment to be sure that we don't
+	// potentially leak C resources which cannot be collected.
+	for {
+		cur, ok := m.logCursorPool.Get().(*lmdb.Cursor)
+		if ok {
+			cur.Close()
+		} else {
+			break
+		}
+	}
+	m.txnPool.Close()
 	m.env.Close()
 	return nil
-}
-
-func (m *MDBStore) txnReadonly() (*lmdb.Txn, error) {
-	txn, ok := m.txnPool.Get().(*lmdb.Txn)
-	if !ok {
-		return m.env.BeginTxn(nil, lmdb.Readonly)
-	}
-	err := txn.Renew()
-	if err != nil {
-		return m.env.BeginTxn(nil, lmdb.Readonly)
-	}
-	return txn, nil
-}
-
-func (m *MDBStore) txnReturn(txn *lmdb.Txn) {
-	txn.Reset()
-	m.txnPool.Put(txn)
 }
 
 func (m *MDBStore) logsCursor(txn *lmdb.Txn) (*lmdb.Cursor, error) {
@@ -195,11 +190,13 @@ func (m *MDBStore) LastIndex() (uint64, error) {
 }
 
 func (m *MDBStore) getIndex(op uint) (uint64, error) {
-	txn, err := m.txnReadonly()
+	txn, err := m.txnPool.BeginTxn(lmdb.Readonly)
 	if err != nil {
 		return 0, err
 	}
-	defer m.txnReturn(txn)
+	defer m.txnPool.Abort(txn)
+
+	txn.RawRead = true
 
 	cur, err := m.logsCursor(txn)
 	if err != nil {
@@ -223,11 +220,11 @@ func (m *MDBStore) getIndex(op uint) (uint64, error) {
 
 // GetLog gets a log entry at a given index
 func (m *MDBStore) GetLog(index uint64, logOut *raft.Log) error {
-	txn, err := m.txnReadonly()
+	txn, err := m.txnPool.BeginTxn(lmdb.Readonly)
 	if err != nil {
 		return err
 	}
-	defer m.txnReturn(txn)
+	defer m.txnPool.Abort(txn)
 
 	txn.RawRead = true
 
@@ -241,7 +238,6 @@ func (m *MDBStore) GetLog(index uint64, logOut *raft.Log) error {
 
 	// Convert the value to a log
 	return decodeMsgPack(val, logOut)
-
 }
 
 // StoreLog stores a log entry
@@ -251,7 +247,7 @@ func (m *MDBStore) StoreLog(log *raft.Log) error {
 		return err
 	}
 
-	return m.env.Update(func(txn *lmdb.Txn) error {
+	return m.txnPool.Update(func(txn *lmdb.Txn) error {
 		val := bytes.NewBuffer(nil)
 		return m.putLog(txn, log, val)
 	})
@@ -265,7 +261,7 @@ func (m *MDBStore) StoreLogs(logs []*raft.Log) error {
 	}
 
 	// Start write txn
-	return m.env.Update(func(txn *lmdb.Txn) error {
+	return m.txnPool.Update(func(txn *lmdb.Txn) error {
 		val := bytes.NewBuffer(nil)
 		for _, log := range logs {
 			err := m.putLog(txn, log, val)
@@ -299,7 +295,7 @@ func (m *MDBStore) DeleteRange(minIdx, maxIdx uint64) error {
 	}
 
 	// Start write txn
-	return m.env.Update(func(txn *lmdb.Txn) (err error) {
+	return m.txnPool.Update(func(txn *lmdb.Txn) (err error) {
 		txn.RawRead = true
 		s := lmdbscan.New(txn, m.dbLogs)
 		defer s.Close()
@@ -324,7 +320,7 @@ func (m *MDBStore) Set(key, val []byte) error {
 		return err
 	}
 
-	return m.env.Update(func(txn *lmdb.Txn) error {
+	return m.txnPool.Update(func(txn *lmdb.Txn) error {
 		return txn.Put(m.dbConf, key, val, 0)
 	})
 }
@@ -336,7 +332,7 @@ func (m *MDBStore) SetUint64(key []byte, val uint64) error {
 		return err
 	}
 
-	return m.env.Update(func(txn *lmdb.Txn) error {
+	return m.txnPool.Update(func(txn *lmdb.Txn) error {
 		m.bufu64 = uint64ToBytes(m.bufu64[:0], val)
 		return txn.Put(m.dbConf, key, m.bufu64, 0)
 	})
@@ -344,27 +340,29 @@ func (m *MDBStore) SetUint64(key []byte, val uint64) error {
 
 // Get returns the value for a given key.
 func (m *MDBStore) Get(key []byte) ([]byte, error) {
-	txn, err := m.txnReadonly()
+	txn, err := m.txnPool.BeginTxn(lmdb.Readonly)
 	if err != nil {
 		return nil, err
 	}
-	defer m.txnReturn(txn)
+	defer m.txnPool.Abort(txn)
 
 	val, err := txn.Get(m.dbConf, key)
+	if err == nil {
+		return val, nil
+	}
 	if lmdb.IsNotFound(err) {
 		return nil, fmt.Errorf("not found")
 	}
-
-	return val, err
+	return nil, err
 }
 
 // GetUint64 returns the value of a key interpreted as a uint64 value.
 func (m *MDBStore) GetUint64(key []byte) (v64 uint64, err error) {
-	txn, err := m.txnReadonly()
+	txn, err := m.txnPool.BeginTxn(lmdb.Readonly)
 	if err != nil {
 		return 0, err
 	}
-	defer m.txnReturn(txn)
+	defer m.txnPool.Abort(txn)
 
 	txn.RawRead = true
 
