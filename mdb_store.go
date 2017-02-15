@@ -26,6 +26,14 @@ var mdbPath = "mdb/"
 // MDBStore provides an implementation of LogStore and StableStore,
 // all backed by a single MDB database.
 type MDBStore struct {
+	// Determines how frequently the MDBStore will check for stale readers.
+	// ReaderCheck is guaranteed to be called between any two updates more than
+	// ReaderCheckPeriod apart.  If ReaderCheckPeriod is the MDBStore will only
+	// check for stale readers while initializing.  ReaderCheckPeriod only
+	// needs to be non-zero if other applications read from the backing
+	// database concurrently.
+	ReaderCheckPeriod time.Duration
+
 	env     *lmdb.Env
 	path    string
 	maxSize int64
@@ -107,7 +115,9 @@ func (m *MDBStore) initialize() error {
 		return err
 	}
 
-	_, err = m.checkStaleReaders()
+	// Always check for stale readers when initializing an MDBStore, whether to
+	// check again after initialization is governed by the m.ReaderCheckPeriod.
+	_, err = m.checkStaleReaders(true)
 	if err != nil {
 		return err
 	}
@@ -171,8 +181,12 @@ func (m *MDBStore) logsCursor(txn *lmdb.Txn) (*lmdb.Cursor, error) {
 //
 // m.env.ReaderCheck runs quickly, but you wouldn't want to call it every
 // second.
-func (m *MDBStore) checkStaleReaders() (int, error) {
-	if m.readersChecked.IsZero() || time.Since(m.readersChecked) > time.Minute {
+func (m *MDBStore) checkStaleReaders(force bool) (int, error) {
+	if !force && m.ReaderCheckPeriod == 0 {
+		return 0, nil
+	}
+
+	if m.readersChecked.IsZero() || time.Since(m.readersChecked) > m.ReaderCheckPeriod {
 		m.readersChecked = time.Now()
 		return m.env.ReaderCheck()
 	}
@@ -242,7 +256,7 @@ func (m *MDBStore) GetLog(index uint64, logOut *raft.Log) error {
 
 // StoreLog stores a log entry
 func (m *MDBStore) StoreLog(log *raft.Log) error {
-	_, err := m.checkStaleReaders()
+	_, err := m.checkStaleReaders(false)
 	if err != nil {
 		return err
 	}
@@ -255,7 +269,7 @@ func (m *MDBStore) StoreLog(log *raft.Log) error {
 
 // StoreLogs stores multiple log entries
 func (m *MDBStore) StoreLogs(logs []*raft.Log) error {
-	_, err := m.checkStaleReaders()
+	_, err := m.checkStaleReaders(false)
 	if err != nil {
 		return err
 	}
@@ -289,7 +303,7 @@ func (m *MDBStore) putLog(txn *lmdb.Txn, log *raft.Log, val *bytes.Buffer) error
 
 // DeleteRange deletes a range of log entries. The range is inclusive.
 func (m *MDBStore) DeleteRange(minIdx, maxIdx uint64) error {
-	_, err := m.checkStaleReaders()
+	_, err := m.checkStaleReaders(false)
 	if err != nil {
 		return err
 	}
@@ -315,7 +329,7 @@ func (m *MDBStore) DeleteRange(minIdx, maxIdx uint64) error {
 
 // Set associates a key with a value.
 func (m *MDBStore) Set(key, val []byte) error {
-	_, err := m.checkStaleReaders()
+	_, err := m.checkStaleReaders(false)
 	if err != nil {
 		return err
 	}
@@ -327,7 +341,7 @@ func (m *MDBStore) Set(key, val []byte) error {
 
 // SetUint64 sets a key to a uint64 value.
 func (m *MDBStore) SetUint64(key []byte, val uint64) error {
-	_, err := m.checkStaleReaders()
+	_, err := m.checkStaleReaders(false)
 	if err != nil {
 		return err
 	}
